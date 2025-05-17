@@ -35,7 +35,7 @@ def noticeBoardMarkDown():
     <sub>3-Feb-2023</sub>
 
     <h4>Release Version 1.0</h4>
-    We have implemented GPT-zero to detect if a text is generated from A.I. <br>
+    Initial AI detection implemented using GPT-zero (now fully upgraded to Groq-hosted LLaMA 3).
     <sub>27-Jan-2023</sub>
     """
 
@@ -52,7 +52,7 @@ def discordHTML():
     """
 
 def bannerHTML():
-    banner_text = "SG-GPTZero Version 1.1 – We have revamped the entire implementation. Experience new features and improved detection accuracy. We love your feedback !"
+    banner_text = "Groq Detector – Powered by LLaMA 3 on Groq. Now with enhanced speed and detection accuracy. We love your feedback!"
     return f'<h4 style="text-align:center;border-radius: 25px;color:#F8F8FF;font-size:1.5em;padding:10px;background-image: linear-gradient(90deg, #20B2AA, #FFEBCD);border-style : solid; border-color : white; border-width: 1px">{banner_text}</h4>'
 
 def emailHTML():

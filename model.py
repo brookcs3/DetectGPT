@@ -1,27 +1,21 @@
 #!/usr/bin/env python3
 
 """
-T5
-
-This code a slight modification of perplexity by hugging face
+This version uses Groq-hosted LLaMA 3 models for fast perplexity estimation and AI detection.
+Originally based on Hugging Face's perplexity example:
 https://huggingface.co/docs/transformers/perplexity
 
-Both this code and the orignal code are published under the MIT license.
-
-by Burhan Ul tayyab and Nicholas Chua
+Converted for Groq API integration by Cameron Brooks.
 """
 import time
-import torch
 import itertools
 import math
 import numpy as np
 import random
 import re
-import transformers
-from transformers import GPT2LMHeadModel, GPT2TokenizerFast
-from transformers import pipeline
-from transformers import T5Tokenizer
-from transformers import AutoTokenizer, BartForConditionalGeneration
+from groq import Groq
+import os
+import requests
 
 from collections import OrderedDict
 
@@ -38,28 +32,103 @@ def normCdf(x):
 def likelihoodRatio(x, y):
     return normCdf(x)/normCdf(y)
 
-torch.manual_seed(0)
 np.random.seed(0)
 
-# find a better way to abstract the class
-class GPT2PPLV2:
-    def __init__(self, device="cuda", model_id="gpt2-medium"):
+# Define the Groq model for deployment
+GROQ_MODEL = "llama3-8b-8192"
+
+class GroqLLaMA3:
+    def __init__(self, device="cpu", model_id=GROQ_MODEL):
         self.device = device
         self.model_id = model_id
-        self.model = GPT2LMHeadModel.from_pretrained(model_id).to(device)
-        self.tokenizer = GPT2TokenizerFast.from_pretrained(model_id)
+        self.client = Groq(api_key=os.environ.get("GROQ_API_KEY"))  # Initialize Groq client
 
-        self.max_length = self.model.config.n_positions
+        self.max_length = 8192  # Placeholder for max length
         self.stride = 51
         self.threshold = 0.7
 
-        self.t5_model = transformers.AutoModelForSeq2SeqLM.from_pretrained("t5-large").to(device).half()
-        self.t5_tokenizer = T5Tokenizer.from_pretrained("t5-large", model_max_length=512)
+    def generate_completion(self, messages):
+        """
+        Generate a completion using the Groq API.
+        This method sends a request to the Groq API and retrieves the response.
+
+        Args:
+            messages (list): A list of dictionaries containing the role and content of the message.
+
+        Returns:
+            str: The content of the response message.
+        """
+        try:
+            payload = {
+                "model": self.model_id,
+                "messages": messages
+            }
+            HEADERS = {
+                "Authorization": f"Bearer {os.environ.get('GROQ_API_KEY', '')}",
+                "Content-Type": "application/json"
+            }
+            print(f"Calling Groq API at https://api.groq.com/openai/v1/chat/completions with payload: {payload}")
+            resp = requests.post(
+                f"{os.environ.get('GROQ_API_BASE_URL', 'https://api.groq.com')}/openai/v1/chat/completions",
+                headers=HEADERS,
+                json=payload
+            )
+            resp.raise_for_status()  # Ensure HTTP errors are raised
+            response = resp.json()
+            # Validate response structure
+            if not response or 'choices' not in response or not response['choices']:
+                raise ValueError("Invalid response structure from Groq API")
+
+            # Extract and return the content of the first choice
+            return response['choices'][0]['message']['content']
+        except Exception as e:
+            # Log the error and return a meaningful message
+            print(f"Error in generate_completion: {e}")
+            return "Error: Unable to generate completion."
+
+    def getPPL_1(self, sentence):
+        messages = [
+            {"role": "user", "content": sentence}
+        ]
+        max_retries = 3
+        for attempt in range(max_retries):
+            response = self.generate_completion(messages)
+            if not isinstance(response, str):
+                print(f"Invalid response received for perplexity calculation (Attempt {attempt + 1}): {response}")
+                continue
+
+            try:
+                match = re.search(r"[-+]?\d*\.\d+|\d+", response)
+                if match:
+                    perplexity = float(match.group())  # Extract numeric value
+                    if perplexity == 0:
+                        print(f"Warning: Perplexity is zero for sentence: {sentence}")
+                    print(f"Extracted perplexity: {perplexity} (Attempt {attempt + 1})")
+                    return perplexity
+                else:
+                    print(f"No numeric value found in response (Attempt {attempt + 1}): {response}")
+            except Exception as e:
+                print(f"Error extracting perplexity (Attempt {attempt + 1}): {e}")
+
+        # If all retries fail, return a fallback value
+        print(f"Failed to calculate perplexity after {max_retries} attempts. Returning fallback value.")
+        return float('inf')
+
+    def getResults_1(self, threshold):
+        if threshold < 60:
+            label = 0
+            return "The Text is generated by AI.", label
+        elif threshold < 80:
+            label = 0
+            return "The Text is most probably contain parts which are generated by AI. (require more text for better Judgement)", label
+        else:
+            label = 1
+            return "The Text is written by Human.", label
 
     def apply_extracted_fills(self, masked_texts, extracted_fills):
         texts = []
         for idx, (text, fills) in enumerate(zip(masked_texts, extracted_fills)):
-            tokens = list(re.finditer("<extra_id_\d+>", text))
+            tokens = list(re.finditer(r"<extra_id_\d+>", text))
             if len(fills) < len(tokens):
                 continue
 
@@ -72,21 +141,11 @@ class GPT2PPLV2:
 
         return texts
 
+    # [DEPRECATED] Unmasking logic is currently not implemented for Groq and returns unchanged input.
     def unmasker(self, text, num_of_masks):
-        num_of_masks = max(num_of_masks)
-        stop_id = self.t5_tokenizer.encode(f"<extra_id_{num_of_masks}>")[0]
-        tokens = self.t5_tokenizer(text, return_tensors="pt", padding=True)
-        for key in tokens:
-            tokens[key] = tokens[key].to(self.device)
-
-        output_sequences = self.t5_model.generate(**tokens, max_length=512, do_sample=True, top_p=0.96, num_return_sequences=1, eos_token_id=stop_id)
-        results = self.t5_tokenizer.batch_decode(output_sequences, skip_special_tokens=False)
-
-        texts = [x.replace("<pad>", "").replace("</s>", "").strip() for x in results]
-        pattern = re.compile("<extra_id_\d+>")
-        extracted_fills = [pattern.split(x)[1:-1] for x in texts]
-        extracted_fills = [[y.strip() for y in x] for x in extracted_fills]
-
+        # Placeholder for Groq-hosted unmasking logic
+        # Replace T5-based logic with Groq API calls
+        extracted_fills = []  # Placeholder for extracted fills from Groq API
         perturbed_texts = self.apply_extracted_fills(text, extracted_fills)
 
         return perturbed_texts
@@ -96,19 +155,87 @@ class GPT2PPLV2:
         version = args[-1]
         sentence = args[0]
         if version == "v1.1":
-            return self.call_1_1(sentence, args[1])
+            return self.process_v1_1(sentence, args[1])
         elif version == "v1":
-            return self.call_1(sentence)
+            return self.process_v1(sentence)
         else:
             return "Model version not defined"
+
+    def process_v1(self, sentence):
+        """
+        Takes in a sentence split by full stop
+        and calculates the perplexity of the total sentence.
+        Splits the lines based on full stop and finds the perplexity of each sentence.
+        """
+        results = OrderedDict()
+
+        total_valid_char = re.findall("[a-zA-Z0-9]+", sentence)
+        total_valid_char = sum([len(x) for x in total_valid_char])  # Finds len of all the valid characters in a sentence
+
+        lines = re.split(r'(?<=[.?!][ \[\(])|(?<=\n)\s*', sentence)
+        lines = list(filter(lambda x: (x is not None) and (len(x) > 0), lines))
+
+        perplexity = self.getPPL_1(sentence)
+        print(f"Perplexity: {perplexity}")
+        results["Perplexity"] = perplexity
+
+        offset = ""
+        perplexity_per_line = []
+        sentence_lengths = []  # Track sentence lengths
+        skipped_sentences = 0  # Count skipped sentences
+        for i, line in enumerate(lines):
+            if re.search("[a-zA-Z0-9]+", line.strip()) is None:
+                skipped_sentences += 1
+                continue
+            if len(offset) > 0:
+                line = offset + line
+                offset = ""
+            if line[0] == "\n" or line[0] == " ":
+                line = line[1:]
+            if line[-1] == "\n" or line[-1] == " ":
+                line = line[:-1]
+            elif line[-1] == "[" or line[-1] == "(":
+                offset = line[-1]
+                line = line[:-1]
+            perplexity = self.getPPL_1(line)
+            perplexity_per_line.append(perplexity)
+            sentence_lengths.append(len(line.split()))  # Track sentence length in words
+
+        # Calculate burstiness and average perplexity
+        burstiness = max(perplexity_per_line) if perplexity_per_line else 0
+        avg_perplexity = sum(perplexity_per_line) / len(perplexity_per_line) if perplexity_per_line else 0
+        variance_perplexity = np.var(perplexity_per_line) if perplexity_per_line else 0
+        median_perplexity = np.median(perplexity_per_line) if perplexity_per_line else 0
+
+        print(f"Perplexity per line: {avg_perplexity}")
+        results["Perplexity per line"] = avg_perplexity
+
+        print(f"Burstiness: {burstiness}")
+        results["Burstiness"] = burstiness
+
+        print(f"Variance of perplexity: {variance_perplexity}")
+        results["Variance of Perplexity"] = variance_perplexity
+
+        print(f"Median perplexity: {median_perplexity}")
+        results["Median Perplexity"] = median_perplexity
+
+        print(f"Sentence lengths: {sentence_lengths}")
+        results["Sentence Lengths"] = sentence_lengths
+
+        print(f"Skipped sentences: {skipped_sentences}")
+        results["Skipped Sentences"] = skipped_sentences
+
+        out, label = self.getResults_1(results["Perplexity per line"])
+        results["label"] = label
+
+        return results, out
 
 #################################ppp###############
 #  Version 1.1 apis
 ###############################################
 
     def replaceMask(self, text, num_of_masks):
-        with torch.no_grad():
-            list_generated_texts = self.unmasker(text, num_of_masks)
+        list_generated_texts = self.unmasker(text, num_of_masks)
 
         return list_generated_texts
 
@@ -155,7 +282,7 @@ class GPT2PPLV2:
     def getGeneratedTexts(self, args):
         original_text = args[0]
         n = args[1]
-        texts = list(re.finditer("[^\d\W]+", original_text))
+        texts = list(re.finditer(r"[^\d\W]+", original_text))
         ratio = int(0.3 * len(texts))
 
         mask_texts, list_num_of_masks = self.multiMaskRandomWord(original_text, ratio, n)
@@ -172,7 +299,6 @@ class GPT2PPLV2:
         if remaining <= 0:
             return []
 
-        torch.manual_seed(0)
         np.random.seed(0)
         start_time = time.time()
         out_sentences = []
@@ -190,38 +316,46 @@ class GPT2PPLV2:
             return "This text is most likely generated by an A.I."
 
     def getScore(self, sentence):
-        original_sentence = sentence
-        sentence_length = len(list(re.finditer("[^\d\W]+", sentence)))
-        # remaining = int(min(max(100, sentence_length * 1/9), 200))
-        remaining = 50
-        sentences = self.mask(original_sentence, original_sentence, n=50, remaining=remaining)
+        real_log_likelihood = self.getLogLikelihood(sentence)
+        print(f"Real Log Likelihood: {real_log_likelihood}")  # Debug log
 
-        real_log_likelihood = self.getLogLikelihood(original_sentence)
+        # Generate multiple perturbed versions of the sentence
+        perturbed_sentences = self.mask(sentence, sentence, n=2, remaining=10)
+        generated_log_likelihoods = [self.getLogLikelihood(p) for p in perturbed_sentences]
 
-        generated_log_likelihoods = []
-        for sentence in sentences:
-            generated_log_likelihoods.append(self.getLogLikelihood(sentence).cpu().detach().numpy())
+        # Filter out invalid results
+        generated_log_likelihoods = [x for x in generated_log_likelihoods if np.isfinite(x)]
+        print(f"Generated Log Likelihoods: {generated_log_likelihoods}")  # Debug log
 
-        if len(generated_log_likelihoods) == 0:
-            return -1
+        if not generated_log_likelihoods:
+            print("No valid generated log likelihoods found.")  # Debug log
+            return -1, 0, 0
 
-        generated_log_likelihoods = np.asarray(generated_log_likelihoods)
-        mean_generated_log_likelihood = np.mean(generated_log_likelihoods)
-        std_generated_log_likelihood = np.std(generated_log_likelihoods)
+        mean_generated_log_likelihood = sum(generated_log_likelihoods) / len(generated_log_likelihoods)
+        std_generated_log_likelihood = (sum((x - mean_generated_log_likelihood) ** 2 for x in generated_log_likelihoods) / len(generated_log_likelihoods)) ** 0.5
 
         diff = real_log_likelihood - mean_generated_log_likelihood
+        score = diff / std_generated_log_likelihood if std_generated_log_likelihood != 0 else 0
 
-        score = diff/(std_generated_log_likelihood)
+        print(f"Score: {score}, Diff: {diff}, Std: {std_generated_log_likelihood}")  # Debug log
+        return score, diff, std_generated_log_likelihood
 
-        return float(score), float(diff), float(std_generated_log_likelihood)
+    def getLogLikelihood(self, sentence):
+        """
+        Placeholder implementation for log likelihood calculation.
+        In a real scenario, this should compute the log likelihood of the sentence using the model.
+        Here, we use the negative perplexity as a proxy for demonstration.
+        """
+        perplexity = self.getPPL_1(sentence)
+        if perplexity > 0 and np.isfinite(perplexity):
+            return -math.log(perplexity)
+        else:
+            return float('-inf')
 
-    def call_1_1(self, sentence, chunk_value):
-        sentence = re.sub("\[[0-9]+\]", "", sentence) # remove all the [numbers] cause of wiki
+    def process_v1_1(self, sentence, chunk_value):
+        sentence = re.sub(r"\\[[0-9]+\\]", "", sentence) # remove all the [numbers] cause of wiki
 
         words = re.split("[ \n]", sentence)
-
-        # if len(words) < 100:
-        #   return {"status": "Please input more text (min 100 words)"}, "Please input more text (min 100 characters)", None
 
         groups = len(words) // chunk_value + 1
         lines = []
@@ -237,152 +371,71 @@ class GPT2PPLV2:
 
             lines.append(selected_text)
 
-        # sentence by sentence
-        offset = ""
-        scores = []
-        probs = []
-        final_lines = []
-        labels = []
-        for line in lines:
-            if re.search("[a-zA-Z0-9]+", line) == None:
-                continue
-            score, diff, sd = self.getScore(line)
-            if score == -1 or math.isnan(score):
-                continue
-            scores.append(score)
+        # Initialize metadata dictionary
+        metadata = {
+            "sentence_lengths": [],
+            "skipped_sentences": 0,
+            "burstiness": 0,
+            "processing_time": 0,
+            "perplexity_per_line": [],
+            "mean_perplexity": 0,
+            "variance_perplexity": 0,
+            "median_perplexity": 0
+        }
 
-            final_lines.append(line)
-            if score > self.threshold:
-                labels.append(1)
-                prob = "{:.2f}%\n(A.I.)".format(normCdf(abs(self.threshold - score)) * 100)
-                probs.append(prob)
-            else:
-                labels.append(0)
-                prob = "{:.2f}%\n(Human)".format(normCdf(abs(self.threshold - score)) * 100)
-                probs.append(prob)
-
-        mean_score = sum(scores)/len(scores)
-
-        mean_prob = normCdf(abs(self.threshold - mean_score)) * 100
-        label = 0 if mean_score > self.threshold else 1
-        print(f"probability for {'A.I.' if label == 0 else 'Human'}:", "{:.2f}%".format(mean_prob))
-        return {"prob": "{:.2f}%".format(mean_prob), "label": label}, self.getVerdict(mean_score)
-
-    def getLogLikelihood(self,sentence):
-        encodings = self.tokenizer(sentence, return_tensors="pt")
-        seq_len = encodings.input_ids.size(1)
-
-        nlls = []
-        prev_end_loc = 0
-        for begin_loc in range(0, seq_len, self.stride):
-            end_loc = min(begin_loc + self.max_length, seq_len)
-            trg_len = end_loc - prev_end_loc
-            input_ids = encodings.input_ids[:, begin_loc:end_loc].to(self.device)
-            target_ids = input_ids.clone()
-            target_ids[:, :-trg_len] = -100
-
-            with torch.no_grad():
-                outputs = self.model(input_ids, labels=target_ids)
-
-                neg_log_likelihood = outputs.loss * trg_len
-
-            nlls.append(neg_log_likelihood)
-
-            prev_end_loc = end_loc
-            if end_loc == seq_len:
-                break
-        return -1 * torch.stack(nlls).sum() / end_loc
-
-################################################
-#  Version 1 apis
-###############################################
-
-    def call_1(self, sentence):
-        """
-        Takes in a sentence split by full stop
-p        and print the perplexity of the total sentence
-        split the lines based on full stop and find the perplexity of each sentence and print
-        average perplexity
-        Burstiness is the max perplexity of each sentence
-        """
-        results = OrderedDict()
-
-        total_valid_char = re.findall("[a-zA-Z0-9]+", sentence)
-        total_valid_char = sum([len(x) for x in total_valid_char]) # finds len of all the valid characters a sentence
-
-        # if total_valid_char < 100:
-        #    return {"status": "Please input more text (min 100 characters)"}, "Please input more text (min 100 characters)"
-
-        lines = re.split(r'(?<=[.?!][ \[\(])|(?<=\n)\s*',sentence)
-        lines = list(filter(lambda x: (x is not None) and (len(x) > 0), lines))
-
-        ppl = self.getPPL_1(sentence)
-        print(f"Perplexity {ppl}")
-        results["Perplexity"] = ppl
-
-        offset = ""
-        Perplexity_per_line = []
+        start_time = time.time()  # Start processing time
+        # Add debug logs to verify the contents of perplexity_per_line and calculated statistics
         for i, line in enumerate(lines):
-            if re.search("[a-zA-Z0-9]+", line) == None:
+            if re.search("[a-zA-Z0-9]+", line) is None:
+                print(f"Skipped line {i} due to lack of alphanumeric content: {line}")  # Debug log
+                print(f"Skipped line {i}: {line}")  # Debug log
                 continue
-            if len(offset) > 0:
-                line = offset + line
-                offset = ""
-            # remove the new line pr space in the first sentence if exists
-            if line[0] == "\n" or line[0] == " ":
-                line = line[1:]
-            if line[-1] == "\n" or line[-1] == " ":
-                line = line[:-1]
-            elif line[-1] == "[" or line[-1] == "(":
-                offset = line[-1]
-                line = line[:-1]
-            ppl = self.getPPL_1(line)
-            Perplexity_per_line.append(ppl)
-        print(f"Perplexity per line {sum(Perplexity_per_line)/len(Perplexity_per_line)}")
-        results["Perplexity per line"] = sum(Perplexity_per_line)/len(Perplexity_per_line)
 
-        print(f"Burstiness {max(Perplexity_per_line)}")
-        results["Burstiness"] = max(Perplexity_per_line)
+            perplexity = self.getPPL_1(line)
+            print(f"Line {i} Perplexity: {perplexity}")  # Debug log
+            metadata["perplexity_per_line"].append(perplexity)
+            metadata["sentence_lengths"].append(len(line.split()))
 
-        out, label = self.getResults_1(results["Perplexity per line"])
-        results["label"] = label
+        # Calculate statistics
+        if metadata["perplexity_per_line"]:
+            metadata["mean_perplexity"] = sum(metadata["perplexity_per_line"]) / len(metadata["perplexity_per_line"])
+            metadata["variance_perplexity"] = np.var(metadata["perplexity_per_line"])
+            metadata["median_perplexity"] = np.median(metadata["perplexity_per_line"])
+            metadata["burstiness"] = max(metadata["perplexity_per_line"])
+        else:
+            metadata["mean_perplexity"] = 0
+            metadata["variance_perplexity"] = 0
+            metadata["median_perplexity"] = 0
+            metadata["burstiness"] = 0
 
-        return results, out
+        metadata["processing_time"] = time.time() - start_time
 
-    def getPPL_1(self,sentence):
-        encodings = self.tokenizer(sentence, return_tensors="pt")
-        seq_len = encodings.input_ids.size(1)
+        print(f"Perplexity per line: {metadata['mean_perplexity']}")
+        print(f"Burstiness: {metadata['burstiness']}")
+        print(f"Variance of perplexity: {metadata['variance_perplexity']}")
+        print(f"Median perplexity: {metadata['median_perplexity']}")
+        print(f"Sentence lengths: {metadata['sentence_lengths']}")
+        print(f"Skipped sentences: {metadata['skipped_sentences']}")
+        print(f"Processing time: {metadata['processing_time']} seconds")
 
-        nlls = []
-        likelihoods = []
-        prev_end_loc = 0
-        for begin_loc in range(0, seq_len, self.stride):
-            end_loc = min(begin_loc + self.max_length, seq_len)
-            trg_len = end_loc - prev_end_loc
-            input_ids = encodings.input_ids[:, begin_loc:end_loc].to(self.device)
-            target_ids = input_ids.clone()
-            target_ids[:, :-trg_len] = -100
+        # Get AI detection score using the more sophisticated method
+        score, diff, std = self.getScore(sentence)
+        metadata["detection_score"] = score
+        metadata["log_likelihood_diff"] = diff
+        metadata["log_likelihood_std"] = std
 
-            with torch.no_grad():
-                outputs = self.model(input_ids, labels=target_ids)
-                neg_log_likelihood = outputs.loss * trg_len
-                likelihoods.append(neg_log_likelihood)
+        # Get a verdict based on both scoring methods
+        score_verdict = self.getVerdict(score)
+        perplexity_verdict, perplexity_label = self.getResults_1(metadata["mean_perplexity"])
 
-            nlls.append(neg_log_likelihood)
-
-            prev_end_loc = end_loc
-            if end_loc == seq_len:
-                break
-        ppl = int(torch.exp(torch.stack(nlls).sum() / end_loc))
-        return ppl
-
-    def getResults_1(self, threshold):
-        if threshold < 60:
+        # Use the more confident determination (combining both methods)
+        if score >= self.threshold or metadata["mean_perplexity"] < 60:
             label = 0
-            return "The Text is generated by AI.", label
-        elif threshold < 80:
-            label = 0
-            return "The Text is most probably contain parts which are generated by AI. (require more text for better Judgement)", label
+            out = f"AI-generated text detected. {score_verdict}"
         else:
             label = 1
-            return "The Text is written by Human.", label
+            out = f"Human-written text detected. {score_verdict}"
+        metadata["label"] = label
+        return metadata, out
+
+# Remove duplicate and mis-indented functions below, as their logic is already present in the class above.

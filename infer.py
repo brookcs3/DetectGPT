@@ -1,17 +1,18 @@
 """
-This code a slight modification of perplexity by hugging face
+This version uses Groq-hosted LLaMA 3 models for fast perplexity estimation and AI detection.
+
+Originally based on Hugging Face's perplexity example:
 https://huggingface.co/docs/transformers/perplexity
 
-Both this code and the orignal code are published under the MIT license.
-
-by Burhan Ul tayyab and Nicholas Chua
+Converted for Groq API integration by Cameron Brooks.
 """
 
-from model import GPT2PPLV2 as GPT2PPL
+from model import GroqLLaMA3 as GroqPPL
 
 # initialize the model
-model = GPT2PPL()
+model = GroqPPL()
 
 sentence = "your text here"
 
-model(sentence, 100, "v1.1")
+score, diff, std = model.getScore(sentence)
+print(f"Score: {score:.3f} | Diff: {diff:.3f} | Std Dev: {std:.3f}")
